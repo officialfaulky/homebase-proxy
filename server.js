@@ -134,9 +134,7 @@ async function getHtagToken() {
 }
 
 async function getHtagHeaders() {
-  const token = await getHtagToken();
-  if (token) return { "Authorization": "Bearer " + token, "Content-Type": "application/json" };
-  return { "Authorization": "Bearer " + HTAG_API_KEY, "x-api-key": HTAG_API_KEY, "Content-Type": "application/json" };
+  return { "x-api-key": HTAG_API_KEY, "Content-Type": "application/json" };
 }
 
 // Helper: resolve suburb name + state to HTAG area_id (loc_pid)
