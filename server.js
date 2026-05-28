@@ -1,364 +1,258 @@
-// HomeBase Pocket — ABS Proxy Server
 const express = require("express");
 const cors = require("cors");
-const fetch = require("node-fetch");
+const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
+const { Pool } = require("pg");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+const HTAG_API_KEY = process.env.HTAG_API_KEY;
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const DATABASE_URL = process.env.DATABASE_URL;
+const JWT_SECRET = process.env.JWT_SECRET || "hbp-secret-key-change-in-prod";
 
-const allowedOrigins = [
-  "http://localhost:5173",
-  "http://localhost:5174",
-  "https://homebaseproperty.com.au",
-  "https://www.homebaseproperty.com.au",
-];
-app.use(cors({
-  origin: function(origin, callback) {
-    if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
-    callback(new Error("Not allowed by CORS"));
+// ── Database ─────────────────────────────────────────────────────────────────
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: DATABASE_URL && DATABASE_URL.includes("railway.internal") ? false : { rejectUnauthorized: false },
+});
+
+const initDB = async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        first_name VARCHAR(100),
+        last_name VARCHAR(100),
+        email VARCHAR(255) UNIQUE NOT NULL,
+        phone VARCHAR(50),
+        password_hash VARCHAR(255) NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS user_data (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        profile JSONB DEFAULT '{}',
+        intake JSONB DEFAULT '{}',
+        properties JSONB DEFAULT '[]',
+        fin JSONB DEFAULT '{}',
+        strategy JSONB DEFAULT NULL,
+        suburbs JSONB DEFAULT NULL,
+        updated_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(user_id)
+      );
+    `);
+    console.log("Database initialised");
+  } catch (e) {
+    console.error("DB init error:", e.message);
   }
+};
+
+initDB();
+
+// ── Middleware ────────────────────────────────────────────────────────────────
+app.use(cors({
+  origin: ["https://homebaseproperty.com.au", "http://localhost:5173"],
+  credentials: true,
 }));
 app.use(express.json());
 
-app.get("/api/abs/population", async (req, res) => {
-  const { suburb } = req.query;
-  if (!suburb) return res.status(400).json({ error: "suburb required" });
-
+const authMiddleware = (req, res, next) => {
+  const token = req.headers.authorization?.replace("Bearer ", "");
+  if (!token) return res.status(401).json({ error: "No token" });
   try {
-    const where = "UPPER(sa2_name_2021) LIKE UPPER('" + suburb + "%')";
-    const encoded = encodeURIComponent(where);
-    const url = "https://geo.abs.gov.au/arcgis/rest/services/Hosted/SA2_RP_2024/FeatureServer/0/query?where=" + encoded + "&outFields=sa2_name_2021,Pop_yr2,Chg_y_to_y,Net_intrnl_mi,Net_ovrses_mi,Naturl_incrse&returnGeometry=false&f=json&resultRecordCount=1";
-
-    console.log("Fetching:", url);
-    const response = await fetch(url);
-    const data = await response.json();
-    console.log("ABS response:", JSON.stringify(data).substring(0, 500));
-
-    if (!data.features || data.features.length === 0) {
-      return res.json({ found: false, suburb });
-    }
-
-    const f = data.features[0].attributes;
-    res.json({
-      found: true,
-      suburb: f.sa2_name_2021,
-      population2024: f.Pop_yr2,
-      populationChangePct: f.Chg_y_to_y ? (f.Chg_y_to_y > 0 ? "+" : "") + Number(f.Chg_y_to_y).toFixed(2) + "%" : null,
-      netInternalMigration: f.Net_intrnl_mi,
-      internalMigrationLabel: f.Net_intrnl_mi > 0
-        ? "+" + f.Net_intrnl_mi + " net internal arrivals"
-        : f.Net_intrnl_mi + " net internal departures",
-    });
-  } catch (err) {
-    console.error("ABS error:", err.message);
-    res.status(500).json({ error: "ABS fetch failed", detail: err.message });
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch {
+    res.status(401).json({ error: "Invalid token" });
   }
-});
+};
 
-app.get("/api/abs/approvals", async (req, res) => {
-  const { state } = req.query;
-  if (!state) return res.status(400).json({ error: "state required" });
+// ── Health ────────────────────────────────────────────────────────────────────
+app.get("/health", (req, res) => res.json({ status: "ok" }));
 
-  const stateCodes = { NSW: "1", VIC: "2", QLD: "3", SA: "4", WA: "5", TAS: "6", NT: "7", ACT: "8" };
-  const code = stateCodes[state.toUpperCase()];
-  if (!code) return res.status(400).json({ error: "invalid state" });
-
+// ── Auth: Signup ──────────────────────────────────────────────────────────────
+app.post("/auth/signup", async (req, res) => {
+  const { firstName, lastName, email, phone, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: "Email and password required" });
   try {
-    const url = "https://data.api.abs.gov.au/rest/data/ABS,BUILDING_APPROVALS,1.0.0/1." + code + "..A?startPeriod=2022&endPeriod=2024&detail=dataonly";
-    const response = await fetch(url, { headers: { Accept: "application/vnd.sdmx.data+json" } });
-    const data = await response.json();
-
-    const series = data && data.data && data.data.dataSets && data.data.dataSets[0] && data.data.dataSets[0].series;
-    if (!series) return res.json({ found: false, state });
-
-    const values = Object.values(series).map(function(s) {
-      const obs = s.observations;
-      const keys = Object.keys(obs).sort();
-      return Number(obs[keys[keys.length - 1]][0]);
-    });
-
-    const totalApprovals = values.reduce(function(a, b) { return a + b; }, 0);
-    res.json({
-      found: true,
-      state,
-      totalDwellingApprovals: totalApprovals,
-      supplyPressureLabel: totalApprovals > 50000 ? "High supply pipeline" : totalApprovals > 20000 ? "Moderate supply pipeline" : "Low supply pipeline",
-    });
-  } catch (err) {
-    console.error("ABS approvals error:", err.message);
-    res.status(500).json({ error: "ABS approvals fetch failed", detail: err.message });
-  }
-});
-
-// ── HTAG ─────────────────────────────────────────────────────────────────────
-const HTAG_CLIENT_ID = process.env.HTAG_CLIENT_ID || "e4a941244cf447aba7bfa5508a789731";
-const HTAG_CLIENT_SECRET = process.env.HTAG_CLIENT_SECRET || "ulj7SF73zyTltkohSfet9ggYbT1z97OHlgeLF2d2k62JXYCxOLW9qesHBiGgah9c";
-const HTAG_API_KEY = process.env.HTAG_API_KEY || "sk-org--8PfCuFvxKEHuKO8prXcpqi40blRwu7Wl-HedZCcDnnm3t0ipMfrrzF8RgjSI0r20E67lIYYAa";
-const HTAG_BASE = "https://api.htagai.com/v1";
-
-// OAuth token cache
-let htagToken = null;
-let htagTokenExpiry = 0;
-
-async function getHtagToken() {
-  // Return cached token if still valid
-  if (htagToken && Date.now() < htagTokenExpiry) return htagToken;
-  try {
-    // Try Cognito OAuth token endpoint
-    const tokenUrl = "https://auth.htagai.com/oauth2/token";
-    const body = new URLSearchParams({
-      grant_type: "client_credentials",
-      client_id: HTAG_CLIENT_ID,
-      client_secret: HTAG_CLIENT_SECRET,
-      scope: "htag/read",
-    });
-    const res = await fetch(tokenUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: body.toString(),
-    });
-    const data = await res.json();
-    console.log("HTAG OAuth response:", JSON.stringify(data).substring(0, 200));
-    if (data.access_token) {
-      htagToken = data.access_token;
-      htagTokenExpiry = Date.now() + (data.expires_in || 3600) * 1000 - 60000;
-      console.log("HTAG OAuth token obtained successfully");
-      return htagToken;
-    }
+    const existing = await pool.query("SELECT id FROM users WHERE email = $1", [email.toLowerCase()]);
+    if (existing.rows.length) return res.status(409).json({ error: "Email already registered" });
+    const hash = await bcrypt.hash(password, 10);
+    const result = await pool.query(
+      "INSERT INTO users (first_name, last_name, email, phone, password_hash) VALUES ($1, $2, $3, $4, $5) RETURNING id, first_name, last_name, email, phone",
+      [firstName, lastName, email.toLowerCase(), phone, hash]
+    );
+    const user = result.rows[0];
+    await pool.query("INSERT INTO user_data (user_id) VALUES ($1) ON CONFLICT DO NOTHING", [user.id]);
+    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: "30d" });
+    res.json({ token, user });
   } catch (e) {
-    console.error("HTAG OAuth error:", e.message);
-  }
-  // Fall back to API key
-  console.log("Falling back to API key auth");
-  return null;
-}
-
-async function getHtagHeaders() {
-  return { "x-api-key": HTAG_API_KEY, "Content-Type": "application/json" };
-}
-
-// Helper: resolve suburb name + state to HTAG area_id (loc_pid)
-async function resolveAreaId(suburb, state) {
-  const url = HTAG_BASE + "/reference/locality?name=" + encodeURIComponent(suburb) + "&state_name=" + encodeURIComponent(state) + "&limit=5";
-  const headers = await getHtagHeaders();
-  const res = await fetch(url, { headers });
-  const data = await res.json();
-  if (!data.results || data.results.length === 0) return null;
-  // Prefer exact match, fall back to first result
-  const exact = data.results.find(function(r) {
-    return r.locality.toLowerCase() === suburb.toLowerCase();
-  });
-  return exact ? exact.loc_pid : data.results[0].loc_pid;
-}
-
-// Main HTAG suburb data endpoint — called once per suburb from the app
-app.get("/api/htag/suburb", async (req, res) => {
-  const { suburb, state, property_type } = req.query;
-  if (!suburb || !state) return res.status(400).json({ error: "suburb and state required" });
-
-  const propType = property_type || "house";
-
-  try {
-    // Step 1: resolve area_id
-    const areaId = await resolveAreaId(suburb, state);
-    if (!areaId) return res.json({ found: false, suburb, state });
-
-    const params = "level=suburb&area_id=" + areaId + "&property_type=" + propType;
-
-    // Step 2: fetch all endpoints in parallel
-    const htagH = await getHtagHeaders();
-    const [summaryRes, demandRes, supplyRes, growthRes, scoresRes] = await Promise.all([
-      fetch(HTAG_BASE + "/markets/summary?" + params, { headers: htagH }),
-      fetch(HTAG_BASE + "/markets/demand?" + params, { headers: htagH }),
-      fetch(HTAG_BASE + "/markets/supply?" + params, { headers: htagH }),
-      fetch(HTAG_BASE + "/markets/growth/annualised?" + params, { headers: htagH }),
-      fetch(HTAG_BASE + "/markets/scores?" + params, { headers: htagH }),
-    ]);
-
-    const [summary, demand, supply, growth, scores] = await Promise.all([
-      summaryRes.json(),
-      demandRes.json(),
-      supplyRes.json(),
-      growthRes.json(),
-      scoresRes.json(),
-    ]);
-
-    const s = summary.results && summary.results[0];
-    const d = demand.results && demand.results[0];
-    const su = supply.results && supply.results[0];
-    const g = growth.results && growth.results[0];
-    const sc = scores.results && scores.results[0];
-
-    if (!s) return res.json({ found: false, suburb, state, areaId });
-
-    const fmt = function(n, decimals) {
-      if (n == null) return null;
-      return Number(n).toFixed(decimals != null ? decimals : 1);
-    };
-
-    res.json({
-      found: true,
-      suburb,
-      state,
-      areaId,
-      // Summary
-      typicalPrice: s.typical_price ? "$" + Math.round(s.typical_price).toLocaleString() : null,
-      weeklyRent: s.rent ? "$" + Math.round(s.rent) + "/wk" : null,
-      grossYield: s.gross_yield ? fmt(s.gross_yield * 100) + "%" : null,
-      confidence: s.confidence || null,
-      // Demand
-      vacancyRate: d && d.vacancy_rate != null ? fmt(d.vacancy_rate * 100) + "%" : null,
-      daysOnMarket: d && d.dom != null ? Math.round(d.dom) + " days" : null,
-      discounting: d && d.discounting != null ? fmt(d.discounting * 100) + "%" : null,
-      // Supply
-      stockOnMarket: su && su.som_percent != null ? fmt(su.som_percent * 100) + "%" : null,
-      inventory: su && su.inventory != null ? fmt(su.inventory) + " months" : null,
-      // Growth
-      growth1y: g && g.price_1y_growth_annualised != null ? (g.price_1y_growth_annualised > 0 ? "+" : "") + fmt(g.price_1y_growth_annualised * 100) + "%" : null,
-      growth3y: g && g.price_3y_growth_annualised != null ? (g.price_3y_growth_annualised > 0 ? "+" : "") + fmt(g.price_3y_growth_annualised * 100) + "%" : null,
-      growth5y: g && g.price_5y_growth_annualised != null ? (g.price_5y_growth_annualised > 0 ? "+" : "") + fmt(g.price_5y_growth_annualised * 100) + "%" : null,
-      // Scores
-      rcsOverall: sc && sc.rcs_overall != null ? sc.rcs_overall : null,
-      rcsCashflow: sc && sc.rcs_cashflow != null ? sc.rcs_cashflow : null,
-      rcsGrowth: sc && sc.rcs_capital_growth != null ? sc.rcs_capital_growth : null,
-    });
-
-  } catch (err) {
-    console.error("HTAG error:", err.message);
-    res.status(500).json({ error: "HTAG fetch failed", detail: err.message });
+    console.error("Signup error:", e.message);
+    res.status(500).json({ error: "Signup failed" });
   }
 });
 
-// HTAG Geocode endpoint
+// ── Auth: Login ───────────────────────────────────────────────────────────────
+app.post("/auth/login", async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: "Email and password required" });
+  try {
+    const result = await pool.query("SELECT * FROM users WHERE email = $1", [email.toLowerCase()]);
+    if (!result.rows.length) return res.status(401).json({ error: "Invalid email or password" });
+    const user = result.rows[0];
+    const valid = await bcrypt.compare(password, user.password_hash);
+    if (!valid) return res.status(401).json({ error: "Invalid email or password" });
+    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: "30d" });
+    res.json({ token, user: { id: user.id, first_name: user.first_name, last_name: user.last_name, email: user.email, phone: user.phone } });
+  } catch (e) {
+    console.error("Login error:", e.message);
+    res.status(500).json({ error: "Login failed" });
+  }
+});
+
+// ── Auth: Me ──────────────────────────────────────────────────────────────────
+app.get("/auth/me", authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query("SELECT id, first_name, last_name, email, phone FROM users WHERE id = $1", [req.user.id]);
+    if (!result.rows.length) return res.status(404).json({ error: "User not found" });
+    res.json({ user: result.rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: "Failed to fetch user" });
+  }
+});
+
+// ── User Data: Load ───────────────────────────────────────────────────────────
+app.get("/user/data", authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query("SELECT * FROM user_data WHERE user_id = $1", [req.user.id]);
+    if (!result.rows.length) {
+      await pool.query("INSERT INTO user_data (user_id) VALUES ($1) ON CONFLICT DO NOTHING", [req.user.id]);
+      return res.json({ profile: {}, intake: {}, properties: [], fin: {}, strategy: null, suburbs: null });
+    }
+    const d = result.rows[0];
+    res.json({
+      profile: d.profile || {},
+      intake: d.intake || {},
+      properties: d.properties || [],
+      fin: d.fin || {},
+      strategy: d.strategy || null,
+      suburbs: d.suburbs || null,
+    });
+  } catch (e) {
+    console.error("Load data error:", e.message);
+    res.status(500).json({ error: "Failed to load data" });
+  }
+});
+
+// ── User Data: Save ───────────────────────────────────────────────────────────
+app.post("/user/data", authMiddleware, async (req, res) => {
+  const { profile, intake, properties, fin, strategy, suburbs } = req.body;
+  try {
+    await pool.query(`
+      INSERT INTO user_data (user_id, profile, intake, properties, fin, strategy, suburbs, updated_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+      ON CONFLICT (user_id) DO UPDATE SET
+        profile = COALESCE($2, user_data.profile),
+        intake = COALESCE($3, user_data.intake),
+        properties = COALESCE($4, user_data.properties),
+        fin = COALESCE($5, user_data.fin),
+        strategy = COALESCE($6, user_data.strategy),
+        suburbs = COALESCE($7, user_data.suburbs),
+        updated_at = NOW()
+    `, [
+      req.user.id,
+      profile ? JSON.stringify(profile) : null,
+      intake ? JSON.stringify(intake) : null,
+      properties ? JSON.stringify(properties) : null,
+      fin ? JSON.stringify(fin) : null,
+      strategy ? JSON.stringify(strategy) : null,
+      suburbs ? JSON.stringify(suburbs) : null,
+    ]);
+    res.json({ success: true });
+  } catch (e) {
+    console.error("Save data error:", e.message);
+    res.status(500).json({ error: "Failed to save data" });
+  }
+});
+
+// ── HTAG Proxy ────────────────────────────────────────────────────────────────
+const HTAG_BASE = "https://api.htagai.com/v1";
+const htagHeaders = () => ({ "x-api-key": HTAG_API_KEY, "Content-Type": "application/json" });
+
 app.get("/api/htag/geocode", async (req, res) => {
-  const { address } = req.query;
-  if (!address) return res.status(400).json({ error: "address required" });
   try {
-    const url = HTAG_BASE + "/address/geocode?address=" + encodeURIComponent(address);
-    console.log("HTAG geocode:", url);
-    const htagH2 = await getHtagHeaders();
-    const response = await fetch(url, { headers: htagH2 });
-    const data = await response.json();
-    console.log("HTAG geocode status:", response.status);
-    console.log("HTAG geocode response:", JSON.stringify(data).substring(0, 500));
-    if (!data.results || data.results.length === 0) return res.json({ found: false, status: response.status, raw: data });
-    const r = data.results[0];
-    res.json({
-      found: true,
-      address_key: r.address_key,
-      loc_pid: r.loc_pid,
-      locality: r.locality_name,
-      state: r.state,
-      postcode: r.postcode,
-      lat: r.lat,
-      lon: r.lon,
-    });
-  } catch (err) {
-    console.error("HTAG geocode error:", err.message);
-    res.status(500).json({ error: "geocode failed", detail: err.message });
-  }
+    const { address } = req.query;
+    const r = await fetch(`${HTAG_BASE}/address/geocode?address=${encodeURIComponent(address)}`, { headers: htagHeaders() });
+    const d = await r.json();
+    if (d.results && d.results.length > 0) {
+      const g = d.results[0];
+      res.json({ found: true, address_key: g.address_key, loc_pid: g.loc_pid, locality: g.locality, state: g.state, postcode: g.postcode, lat: g.lat, lon: g.lon });
+    } else {
+      res.json({ found: false });
+    }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// HTAG Property Estimates
 app.get("/api/htag/property/estimates", async (req, res) => {
-  const { address_key } = req.query;
-  if (!address_key) return res.status(400).json({ error: "address_key required" });
   try {
-    const url = HTAG_BASE + "/property/estimates?address_key=" + encodeURIComponent(address_key);
-    const htagH3 = await getHtagHeaders();
-    const response = await fetch(url, { headers: htagH3 });
-    const data = await response.json();
-    if (!data.results || data.results.length === 0) return res.json({ found: false });
-    res.json({ found: true, ...data.results[0] });
-  } catch (err) {
-    res.status(500).json({ error: "estimates failed", detail: err.message });
-  }
+    const { address_key } = req.query;
+    const r = await fetch(`${HTAG_BASE}/property/estimates?address_key=${encodeURIComponent(address_key)}`, { headers: htagHeaders() });
+    const d = await r.json();
+    res.json({ found: true, ...d });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// HTAG Property Summary
 app.get("/api/htag/property/summary", async (req, res) => {
-  const { address_key } = req.query;
-  if (!address_key) return res.status(400).json({ error: "address_key required" });
   try {
-    const url = HTAG_BASE + "/property/summary?address_key=" + encodeURIComponent(address_key);
-    const htagH4 = await getHtagHeaders();
-    const response = await fetch(url, { headers: htagH4 });
-    const data = await response.json();
-    if (!data.results || data.results.length === 0) return res.json({ found: false });
-    res.json({ found: true, ...data.results[0] });
-  } catch (err) {
-    res.status(500).json({ error: "property summary failed", detail: err.message });
-  }
+    const { address_key } = req.query;
+    const r = await fetch(`${HTAG_BASE}/property/summary?address_key=${encodeURIComponent(address_key)}`, { headers: htagHeaders() });
+    const d = await r.json();
+    res.json({ found: true, ...d });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// HTAG Sold Search
 app.get("/api/htag/property/sold", async (req, res) => {
-  const { address_key } = req.query;
-  if (!address_key) return res.status(400).json({ error: "address_key required" });
   try {
-    const url = HTAG_BASE + "/property/sold/search?address_key=" + encodeURIComponent(address_key) + "&radius=1&limit=10&proximity=sameSuburb";
-    const htagH5 = await getHtagHeaders();
-    const response = await fetch(url, { headers: htagH5 });
-    const data = await response.json();
-    res.json({ found: true, sales: data.results || [] });
-  } catch (err) {
-    res.status(500).json({ error: "sold search failed", detail: err.message });
-  }
+    const { address_key } = req.query;
+    const r = await fetch(`${HTAG_BASE}/property/sold/search?address_key=${encodeURIComponent(address_key)}`, { headers: htagHeaders() });
+    const d = await r.json();
+    res.json({ found: true, ...d });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-
-// MCP Property Lookup — calls Claude API server-side with HTAG MCP attached
-app.post("/api/mcp/property", async (req, res) => {
-  const { address, apiKey } = req.body;
-  if (!address) return res.status(400).json({ error: "address required" });
-  const key = apiKey || process.env.ANTHROPIC_API_KEY;
-  if (!key) return res.status(400).json({ error: "api key required" });
+app.get("/api/htag/suburb", async (req, res) => {
   try {
-    console.log("MCP property lookup:", address);
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": key,
-        "anthropic-version": "2023-06-01",
-        "anthropic-beta": "mcp-client-2025-04-04",
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-5-20250929",
-        max_tokens: 1000,
-        system: "You are a property data assistant. Use the HTAG tools to look up the given property address and return a JSON object. Return ONLY valid JSON, no markdown. Include these fields if available: locality, state, postcode, address_key, price_estimate, last_sold_price, last_sold_date, rent_estimate, beds, baths, property_type, lot_size, recent_sales (array of up to 5 nearby sold properties each with address, sale_price, sale_date, distance_km).",
-        messages: [{ role: "user", content: "Look up this Australian property address using HTAG and return all available data as JSON: " + address }],
-        mcp_servers: [{
-          type: "url",
-          url: "https://api.htagai.com/mcp/v1/servers/htag/sse",
-          name: "htag",
-          authorization_token: HTAG_API_KEY,
-        }],
-      }),
+    const { suburb, state, property_type } = req.query;
+    const locRes = await fetch(`${HTAG_BASE}/reference/locality?locality=${encodeURIComponent(suburb.toLowerCase())}&state_name=${encodeURIComponent(state.toLowerCase())}`, { headers: htagHeaders() });
+    const locData = await locRes.json();
+    if (!locData.results || locData.results.length === 0) return res.json({ found: false });
+    const loc_pid = locData.results[0].loc_pid;
+    const propType = (property_type || "house").toLowerCase().includes("unit") ? "unit" : "house";
+    const [mktRes, rcsRes] = await Promise.all([
+      fetch(`${HTAG_BASE}/markets/locality/summary?loc_pid=${loc_pid}&property_type=${propType}`, { headers: htagHeaders() }),
+      fetch(`${HTAG_BASE}/markets/locality/rcs?loc_pid=${loc_pid}&property_type=${propType}`, { headers: htagHeaders() }),
+    ]);
+    const [mkt, rcs] = await Promise.all([mktRes.json(), rcsRes.json()]);
+    res.json({
+      found: true, loc_pid,
+      typicalPrice: mkt.typical_price ? "$" + Math.round(mkt.typical_price).toLocaleString() : null,
+      grossYield: mkt.gross_yield ? (mkt.gross_yield * 100).toFixed(2) + "%" : null,
+      vacancyRate: mkt.vacancy_rate ? (mkt.vacancy_rate * 100).toFixed(2) + "%" : null,
+      daysOnMarket: mkt.days_on_market ? Math.round(mkt.days_on_market) + " days" : null,
+      stockOnMarket: mkt.stock_on_market || null,
+      growth1y: mkt.growth_1y ? (mkt.growth_1y > 0 ? "+" : "") + (mkt.growth_1y * 100).toFixed(1) + "%" : null,
+      growth3y: mkt.growth_3y ? (mkt.growth_3y > 0 ? "+" : "") + (mkt.growth_3y * 100).toFixed(1) + "%" : null,
+      growth5y: mkt.growth_5y ? (mkt.growth_5y > 0 ? "+" : "") + (mkt.growth_5y * 100).toFixed(1) + "%" : null,
+      rcsOverall: rcs.overall || null,
+      rcsCashflow: rcs.cashflow || null,
+      rcsGrowth: rcs.growth || null,
+      inventory: mkt.inventory || null,
+      confidence: mkt.confidence || null,
     });
-    const data = await response.json();
-    console.log("MCP response status:", response.status);
-    if (!response.ok) {
-      console.log("MCP error:", JSON.stringify(data).substring(0, 200));
-      return res.status(response.status).json({ error: "Claude API error", detail: data });
-    }
-    const textBlocks = (data.content || []).filter(b => b.type === "text");
-    const text = textBlocks.map(b => b.text || "").join("").replace(/```json|```/g, "").trim();
-    console.log("MCP text result:", text.substring(0, 200));
-    try {
-      const parsed = JSON.parse(text);
-      res.json({ found: true, ...parsed });
-    } catch {
-      res.json({ found: false, raw: text });
-    }
-  } catch (err) {
-    console.error("MCP property error:", err.message);
-    res.status(500).json({ error: "MCP lookup failed", detail: err.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get("/health", function(req, res) { res.json({ status: "ok" }); });
-
-app.listen(PORT, function() {
-  console.log("HomeBase ABS + HTAG Proxy running at http://localhost:" + PORT);
-});
+app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
