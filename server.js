@@ -4,6 +4,8 @@ const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...ar
 const { Pool } = require("pg");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const Stripe = require("stripe");
+const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -11,11 +13,13 @@ const HTAG_API_KEY = process.env.HTAG_API_KEY;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const DATABASE_URL = process.env.DATABASE_URL;
 const JWT_SECRET = process.env.JWT_SECRET || "hbp-secret-key-change-in-prod";
+const STRIPE_PRICE_ID = process.env.STRIPE_PRICE_ID || "price_1TdKnVAGLF60ncecgjb1wy2C";
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
 
 // ── Database ─────────────────────────────────────────────────────────────────
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: DATABASE_URL && DATABASE_URL.includes("railway.internal") ? false : { rejectUnauthorized: false },
+  ssl: { rejectUnauthorized: false },
 });
 
 const initDB = async () => {
@@ -28,8 +32,15 @@ const initDB = async () => {
         email VARCHAR(255) UNIQUE NOT NULL,
         phone VARCHAR(50),
         password_hash VARCHAR(255) NOT NULL,
+        is_premium BOOLEAN DEFAULT FALSE,
+        stripe_customer_id VARCHAR(255),
+        stripe_subscription_id VARCHAR(255),
         created_at TIMESTAMP DEFAULT NOW()
       );
+      -- Add columns if they dont exist (for existing tables)
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS is_premium BOOLEAN DEFAULT FALSE;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id VARCHAR(255);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id VARCHAR(255);
 
       CREATE TABLE IF NOT EXISTS user_data (
         id SERIAL PRIMARY KEY,
@@ -178,6 +189,118 @@ app.post("/user/data", authMiddleware, async (req, res) => {
   }
 });
 
+// ── Stripe: Create Checkout Session ──────────────────────────────────────────
+app.post("/stripe/create-checkout", authMiddleware, async (req, res) => {
+  try {
+    const userResult = await pool.query("SELECT * FROM users WHERE id = $1", [req.user.id]);
+    const user = userResult.rows[0];
+
+    // Create or retrieve Stripe customer
+    let customerId = user.stripe_customer_id;
+    if (!customerId) {
+      const customer = await stripe.customers.create({
+        email: user.email,
+        name: (user.first_name || "") + " " + (user.last_name || ""),
+        metadata: { user_id: String(user.id) }
+      });
+      customerId = customer.id;
+      await pool.query("UPDATE users SET stripe_customer_id = $1 WHERE id = $2", [customerId, user.id]);
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      customer: customerId,
+      payment_method_types: ["card"],
+      line_items: [{ price: STRIPE_PRICE_ID, quantity: 1 }],
+      mode: "subscription",
+      success_url: "https://homebaseproperty.com.au/pocket?upgraded=true",
+      cancel_url: "https://homebaseproperty.com.au/pocket?cancelled=true",
+      metadata: { user_id: String(user.id) }
+    });
+
+    res.json({ url: session.url });
+  } catch (e) {
+    console.error("Stripe checkout error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Stripe: Cancel Subscription ───────────────────────────────────────────────
+app.post("/stripe/cancel", authMiddleware, async (req, res) => {
+  try {
+    const userResult = await pool.query("SELECT * FROM users WHERE id = $1", [req.user.id]);
+    const user = userResult.rows[0];
+    if (user.stripe_subscription_id) {
+      await stripe.subscriptions.update(user.stripe_subscription_id, { cancel_at_period_end: true });
+    }
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Stripe: Webhook ───────────────────────────────────────────────────────────
+app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  let event;
+  try {
+    event = STRIPE_WEBHOOK_SECRET
+      ? stripe.webhooks.constructEvent(req.body, req.headers["stripe-signature"], STRIPE_WEBHOOK_SECRET)
+      : JSON.parse(req.body);
+  } catch (e) {
+    console.error("Webhook error:", e.message);
+    return res.status(400).send("Webhook Error: " + e.message);
+  }
+
+  try {
+    if (event.type === "checkout.session.completed") {
+      const session = event.data.object;
+      const userId = session.metadata?.user_id;
+      if (userId) {
+        await pool.query(
+          "UPDATE users SET is_premium = TRUE, stripe_subscription_id = $1 WHERE id = $2",
+          [session.subscription, userId]
+        );
+        console.log("User", userId, "upgraded to premium");
+      }
+    }
+    if (event.type === "customer.subscription.deleted" || event.type === "customer.subscription.paused") {
+      const sub = event.data.object;
+      await pool.query(
+        "UPDATE users SET is_premium = FALSE WHERE stripe_subscription_id = $1",
+        [sub.id]
+      );
+      console.log("Subscription cancelled for", sub.id);
+    }
+    if (event.type === "invoice.payment_succeeded") {
+      const invoice = event.data.object;
+      await pool.query(
+        "UPDATE users SET is_premium = TRUE WHERE stripe_customer_id = $1",
+        [invoice.customer]
+      );
+    }
+    if (event.type === "invoice.payment_failed") {
+      const invoice = event.data.object;
+      await pool.query(
+        "UPDATE users SET is_premium = FALSE WHERE stripe_customer_id = $1",
+        [invoice.customer]
+      );
+    }
+  } catch (e) {
+    console.error("Webhook processing error:", e.message);
+  }
+
+  res.json({ received: true });
+});
+
+// ── User Premium Status ───────────────────────────────────────────────────────
+app.get("/user/premium", authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query("SELECT is_premium FROM users WHERE id = $1", [req.user.id]);
+    res.json({ isPremium: result.rows[0]?.is_premium || false });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── HTAG Proxy ────────────────────────────────────────────────────────────────
 const HTAG_BASE = "https://api.htagai.com/v1";
 const htagHeaders = () => ({ "x-api-key": HTAG_API_KEY, "Content-Type": "application/json" });
@@ -185,8 +308,33 @@ const htagHeaders = () => ({ "x-api-key": HTAG_API_KEY, "Content-Type": "applica
 app.get("/api/htag/geocode", async (req, res) => {
   try {
     const { address } = req.query;
-    const r = await fetch(`${HTAG_BASE}/address/geocode?address=${encodeURIComponent(address)}`, { headers: htagHeaders() });
-    const d = await r.json();
+    console.log("Geocoding:", address);
+
+    // Try full address first
+    let r = await fetch(`${HTAG_BASE}/address/geocode?address=${encodeURIComponent(address)}`, { headers: htagHeaders() });
+    let d = await r.json();
+    console.log("HTAG geocode response:", JSON.stringify(d).substring(0, 300));
+
+    // If not found, try stripping to just suburb + state
+    if (!d.results || d.results.length === 0) {
+      const stateMatch = address.match(/\b(NSW|VIC|QLD|WA|SA|TAS|ACT|NT)\b/i);
+      const words = address.split(/\s+/);
+      // Try to find suburb by taking words between street type and state
+      const streetTypes = ['street','drive','road','avenue','place','court','crescent','way','parade','close','boulevard','terrace','lane','circuit','st','dr','rd','ave'];
+      let suburbStart = -1;
+      for (let i = 0; i < words.length; i++) {
+        if (streetTypes.includes(words[i].toLowerCase())) { suburbStart = i + 1; break; }
+      }
+      if (suburbStart > 0 && stateMatch) {
+        const suburbWords = words.slice(suburbStart).filter(w => !w.match(/^\d{4}$/) && !w.match(/^(NSW|VIC|QLD|WA|SA|TAS|ACT|NT)$/i));
+        const suburbQuery = suburbWords.join(' ').trim() + ' ' + stateMatch[0].toUpperCase();
+        console.log("Trying suburb fallback:", suburbQuery);
+        r = await fetch(`${HTAG_BASE}/address/geocode?address=${encodeURIComponent(suburbQuery)}`, { headers: htagHeaders() });
+        d = await r.json();
+        console.log("Suburb fallback response:", JSON.stringify(d).substring(0, 200));
+      }
+    }
+
     if (d.results && d.results.length > 0) {
       const g = d.results[0];
       res.json({ found: true, address_key: g.address_key, loc_pid: g.loc_pid, locality: g.locality, state: g.state, postcode: g.postcode, lat: g.lat, lon: g.lon });
