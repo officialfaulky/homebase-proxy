@@ -347,9 +347,12 @@ app.get("/api/htag/geocode", async (req, res) => {
 app.get("/api/htag/property/estimates", async (req, res) => {
   try {
     const { address_key } = req.query;
-    const r = await fetch(`${HTAG_BASE}/property/estimates?address_key=${encodeURIComponent(address_key)}`, { headers: htagHeaders() });
+    const r = await fetch(`${HTAG_BASE}/property/estimates?address_key=${encodeURIComponent(address_key)}&cma_method=IA`, { headers: htagHeaders() });
     const d = await r.json();
-    res.json({ found: true, ...d });
+    console.log("Estimates response:", JSON.stringify(d).substring(0, 300));
+    const result = d.results && d.results.length > 0 ? d.results[0] : null;
+    if (!result) return res.json({ found: false });
+    res.json({ found: true, ...result });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -358,7 +361,8 @@ app.get("/api/htag/property/summary", async (req, res) => {
     const { address_key } = req.query;
     const r = await fetch(`${HTAG_BASE}/property/summary?address_key=${encodeURIComponent(address_key)}`, { headers: htagHeaders() });
     const d = await r.json();
-    res.json({ found: true, ...d });
+    const result = d.results && d.results.length > 0 ? d.results[0] : d;
+    res.json({ found: true, ...result });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -367,7 +371,7 @@ app.get("/api/htag/property/sold", async (req, res) => {
     const { address_key } = req.query;
     const r = await fetch(`${HTAG_BASE}/property/sold/search?address_key=${encodeURIComponent(address_key)}`, { headers: htagHeaders() });
     const d = await r.json();
-    res.json({ found: true, ...d });
+    res.json({ found: true, sales: d.results || [] });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
